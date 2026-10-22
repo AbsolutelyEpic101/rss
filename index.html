@@ -600,55 +600,47 @@ function parseFeed(xml, feed) {
   articles = articles.filter(a => a.feedId !== feed.id).concat(parsed);
 }
 
+function timedFetch(url, ms = 8000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  return fetch(url, {signal: ctl.signal}).finally(() => clearTimeout(t));
+}
+function looksLikeFeed(text) {
+  return /<(rss|feed|rdf:RDF)[\s>]/i.test(text.slice(0, 3000));
+}
 async function fetchFeed(feed) {
-  const attempts = [
-    async () => {
-      const r = await fetch(feed.url, {cache:"no-store"});
-      if (!r.ok) throw Error("HTTP " + r.status);
-      return r.text();
-    },
-    async () => {
-      const r = await fetch("https://api.allorigins.win/raw?url=" +
-        encodeURIComponent(feed.url));
-      if (!r.ok) throw Error("Proxy HTTP " + r.status);
-      return r.text();
-    },
-    async () => {
-      const r = await fetch("https://corsproxy.io/?url=" +
-        encodeURIComponent(feed.url));
-      if (!r.ok) throw Error("Proxy HTTP " + r.status);
-      return r.text();
-    }
+  const u = encodeURIComponent(feed.url);
+  const sources = [
+    feed.url,
+    "https://api.allorigins.win/raw?url=" + u,
+    "https://corsproxy.io/?url=" + u
   ];
-  let lastError;
-  for (const attempt of attempts) {
-    try {
-      const text = await attempt();
-      parseFeed(text, feed);
-      save();
-      return;
-    } catch (e) { lastError = e; }
-  }
-  throw lastError || Error("Could not fetch this feed.");
+  // try every route at once; the first one that returns a real feed wins
+  const text = await Promise.any(sources.map(async src => {
+    const r = await timedFetch(src);
+    if (!r.ok) throw Error("HTTP " + r.status);
+    const t = await r.text();
+    if (!looksLikeFeed(t)) throw Error("Not a feed");
+    return t;
+  })).catch(() => { throw Error("Could not fetch this feed."); });
+  parseFeed(text, feed);
+  save();
 }
 
 async function refresh(list = feeds) {
   if (busy) return;
   busy = true;
   $("refresh").disabled = $("addBtn").disabled = true;
-  const failures = [];
-  let succeeded = 0;
-  for (let i=0; i<list.length; i++) {
-    status(`Refreshing ${i+1} of ${list.length}…`);
-    try { await fetchFeed(list[i]); succeeded++; }
-    catch (e) { failures.push(list[i].url + ": " + e.message); }
-  }
+  status(`Refreshing ${list.length} feed${list.length === 1 ? "" : "s"}…`);
+  const results = await Promise.allSettled(list.map(fetchFeed));
+  const succeeded = results.filter(r => r.status === "fulfilled").length;
+  const failed = results.length - succeeded;
   busy = false;
   $("refresh").disabled = $("addBtn").disabled = false;
   pickCategory();
   save(); renderFeeds(); renderArticles();
   status(`Updated ${succeeded} of ${list.length} feeds at ${new Date().toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"})}`);
-  if (failures.length) $("error").textContent =
+  if (failed) $("error").textContent =
     "Some feeds failed to load. The site may block browser access.";
 }
 
